@@ -286,4 +286,4 @@ transform.skewed.variables <- function(data.frame, #input data frame containing 
   list(transformed = occ_full,
        summary = transformation.summary,
        background.transformed = bg_full)
-  
+  }
