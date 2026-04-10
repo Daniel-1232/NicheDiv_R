@@ -1,0 +1,289 @@
+## Function to identify and transform skewed variables
+transform.skewed.variables <- function(data.frame, #input data frame containing numeric variables to assess and transform
+                                       background.dataframe = NULL, #optional background data frame to apply identical transformations
+                                       skewness.threshold = 1, #absolute skewness threshold (variables with |skew| ≥ this value are transformed)
+                                       exclude.cols = NULL, #optional vector of columns to exclude from transformations if present
+                                       verbose = TRUE) { #print summary
+  
+  
+  # Validate input arguments
+  if (missing(data.frame) || !is.data.frame(data.frame)) stop("data.frame must be a data frame containing numeric variables")
+  if (!is.null(background.dataframe) && !is.data.frame(background.dataframe)) stop("background.dataframe must be NULL or a data frame")
+  if (!is.numeric(skewness.threshold) || length(skewness.threshold) != 1 || skewness.threshold <= 0) stop("skewness.threshold must be a positive numeric value (recommended: 1)")
+  if (!is.logical(verbose) || length(verbose) != 1) stop("verbose must be TRUE or FALSE")
+  if (!is.null(exclude.cols) && !is.character(exclude.cols)) stop("exclude.cols must be NULL or a character vector of column names")
+  if (is.null(exclude.cols)) exclude.cols <- character(0)
+  
+  # Validate numeric content
+  numeric.cols <- sapply(data.frame, is.numeric)
+  if (sum(numeric.cols) == 0) stop("No numeric columns found in data.frame — nothing to transform")
+  
+  # Extract input
+  data.frame_original <- data.frame
+  background.dataframe_original <- background.dataframe
+  
+  # Validate shared columns if background provided
+  if (!is.null(background.dataframe)) {
+    shared.cols <- intersect(colnames(data.frame), colnames(background.dataframe))
+    if (length(shared.cols) == 0) stop("No shared column names between data.frame and background.dataframe")
+  }
+  
+  # Create function to compute unbiased sample skewness (Fisher–Pearson g1)
+  detect.skewness <- function(numeric.vector) {
+    numeric.vector <- numeric.vector[is.finite(numeric.vector)]
+    sample.size <- length(numeric.vector)
+    if (sample.size < 3) return(NA_real_)
+    standard.deviation <- sd(numeric.vector)
+    if (!is.finite(standard.deviation) || standard.deviation == 0) return(0)
+    mean.value <- mean(numeric.vector)
+    sum(((numeric.vector - mean.value) / standard.deviation)^3) * sample.size / ((sample.size - 1) * (sample.size - 2))
+  }
+  
+  # Create function to detect proportion variables (0–1)
+  is.proportion.variable <- function(numeric.vector, tolerance = 1e-9) {
+    variable.range <- range(numeric.vector[is.finite(numeric.vector)], na.rm = TRUE)
+    if (!is.finite(variable.range[1])) return(FALSE)
+    (variable.range[1] >= -tolerance) && (variable.range[2] <= 1 + tolerance)
+  }
+  
+  # Create function to logit transform (with shrinkage to avoid ±Inf at 0 and 1)
+  perform.logit.transformation <- function(proportion.vector, epsilon = 1e-3) {
+    clipped.values <- pmin(pmax(proportion.vector, 0), 1)
+    adjusted.values <- (clipped.values + epsilon) / (1 + 2 * epsilon)
+    log(adjusted.values / (1 - adjusted.values))
+  }
+  
+  # Create function to choose best transformation for numeric variables
+  choose.best.transformation <- function(variable.values,
+                                         skewness.threshold.local,
+                                         prefer.log.for.right.tail = TRUE) {
+    finite.values <- variable.values[is.finite(variable.values)]
+    if (length(unique(finite.values)) < 3) return(list(name = "none", transformed = variable.values, diagnostics = list(skew.before = NA_real_, skew.after = NA_real_, selection.reason = "none")))
+    skew.before <- detect.skewness(variable.values)
+    if (!is.na(skew.before) && abs(skew.before) < skewness.threshold.local) return(list(name = "none", transformed = variable.values, diagnostics = list(skew.before = skew.before, skew.after = skew.before, selection.reason = "skew_below_threshold")))
+    minimum.value <- suppressWarnings(min(finite.values, na.rm = TRUE))
+    transformation.candidates <- list(identity = variable.values)
+    variable.values <- ifelse(abs(variable.values) < 1e-10, 0, variable.values) #prevent numerical issues near zero (avoid log of tiny/negative values)
+    if (is.finite(minimum.value) && minimum.value > 0) {
+      transformation.candidates$log <- log(variable.values)
+      transformation.candidates$sqrt <- sqrt(variable.values)
+    } else if (is.finite(minimum.value) && minimum.value >= 0) {
+      transformation.candidates$log1p <- log1p(variable.values)
+      transformation.candidates$sqrt <- sqrt(variable.values)
+    } else {
+      shifted.values <- variable.values - min(variable.values, na.rm = TRUE) + 1e-6
+      transformation.candidates$log1p_shifted <- log1p(shifted.values)
+      transformation.candidates$sqrt_shifted  <- sqrt(shifted.values)
+      transformation.candidates$cuberoot <- sign(variable.values) * abs(variable.values)^(1/3)
+    }
+    candidate.skews <- vapply(transformation.candidates, detect.skewness, numeric(1))
+    candidate.abs.skews <- abs(candidate.skews)
+    if (prefer.log.for.right.tail && is.finite(minimum.value) && minimum.value >= 0 && !is.na(skew.before) && (skew.before > 3) && "log" %in% names(transformation.candidates)) {
+      chosen.name <- "log"
+      selection.reason <- "heavy_right_tail"
+    } else {
+      improvements <- abs(skew.before) - candidate.abs.skews
+      if (all(improvements <= 0, na.rm = TRUE)) {
+        chosen.name <- "none"
+        selection.reason <- "transformation_does_not_improve_skewness"
+      } else {
+        chosen.name <- names(which.max(improvements))
+        selection.reason <- "best_transformation_was_chosen"
+      }
+    }
+    if (chosen.name == "none") {
+      transformed.values <- variable.values
+      skew.after <- skew.before
+    } else {
+      transformed.values <- transformation.candidates[[chosen.name]]
+      skew.after <- candidate.skews[[chosen.name]]
+    }
+    list(name = chosen.name,
+         transformed = transformed.values,
+         diagnostics = list(skew.before = skew.before,
+                            skew.after = skew.after,
+                            selection.reason = selection.reason))
+    
+  }
+  
+  # Normalize input and initialize output lists
+  helper_cols <- c(".row_id", ".key")
+  excluded.original <- data.frame[, names(data.frame) %in% exclude.cols, drop = FALSE]
+  data.frame <- data.frame[, !(names(data.frame) %in% c(exclude.cols, helper_cols)), drop = FALSE]
+  transformed.variable.list <- list()
+  summary.record.list <- list()
+  transform.counter <- list()
+  transform.name.map <- list()
+  
+  # Initialize identity mapping for all original columns (including excluded)
+  for (nm in colnames(data.frame_original)) transform.name.map[[nm]] <- nm
+  
+  # If background provided, initialize parallel copy
+  background.transformed.dataframe <- NULL
+  if (!is.null(background.dataframe)) background.transformed.dataframe <- background.dataframe
+  
+  # Count numeric variables used for transformation summary denominator
+  all_numeric_vars <- colnames(data.frame)
+  total.used <- length(all_numeric_vars)
+  
+  # Iterate through each variable
+  for (variable.name in colnames(data.frame)) {
+    variable.values <- data.frame[[variable.name]]
+    
+    # Handle non-numeric or too-few-unique values
+    if (!is.numeric(variable.values) || length(unique(variable.values[is.finite(variable.values)])) < 3) {
+      transformed.variable.list[[variable.name]] <- variable.values
+      transform.name.map[[variable.name]] <- variable.name
+      summary.record.list[[length(summary.record.list) + 1]] <- data.frame(variable = variable.name,
+                                                                           transform_chosen = NA_character_,
+                                                                           transformed = FALSE,
+                                                                           skew_before = NA_real_,
+                                                                           skew_after = NA_real_,
+                                                                           selection_reason = "too_few_unique_values",
+                                                                           stringsAsFactors = FALSE)
+      next
+    }
+    
+    # Detect binary 0/1 variables (presence–absence)
+    unique.values <- sort(unique(variable.values[is.finite(variable.values)]))
+    if (length(unique.values) == 2 && all(unique.values %in% c(0, 1))) {
+      transformed.variable.list[[variable.name]] <- variable.values
+      transform.name.map[[variable.name]] <- variable.name
+      summary.record.list[[length(summary.record.list) + 1]] <- data.frame(variable = variable.name,
+                                                                           transform_chosen = NA_character_,
+                                                                           transformed = FALSE,
+                                                                           skew_before = NA_real_,
+                                                                           skew_after = NA_real_,
+                                                                           selection_reason = "binary_variable_no_transformation",
+                                                                           stringsAsFactors = FALSE)
+      next
+    }
+    
+    # Handle non-binary variables with only two unique values
+    if (length(unique.values) == 2 && !all(unique.values %in% c(0, 1))) {
+      skew.tmp <- detect.skewness(variable.values)
+      transformed.variable.list[[variable.name]] <- variable.values
+      transform.name.map[[variable.name]] <- variable.name
+      summary.record.list[[length(summary.record.list) + 1]] <- data.frame(variable = variable.name,
+                                                                           transform_chosen = NA_character_,
+                                                                           transformed = FALSE,
+                                                                           skew_before = round(skew.tmp, 2),
+                                                                           skew_after = round(skew.tmp, 2),
+                                                                           selection_reason = "two_unique_values_no_transformation",
+                                                                           stringsAsFactors = FALSE)
+      next
+    }
+    
+    # Detect and transform proportion (0–1 continuous) variables
+    if (is.proportion.variable(variable.values)) {
+      finite.values <- variable.values[is.finite(variable.values)]
+      skew.before <- detect.skewness(finite.values)
+      logit.values <- perform.logit.transformation(variable.values)
+      arcsin.values <- asin(sqrt(pmin(pmax(variable.values, 0), 1)))
+      skew.logit <- detect.skewness(logit.values)
+      skew.arcsin <- detect.skewness(arcsin.values)
+      improvements <- c(abs(skew.before) - abs(skew.logit),
+                        abs(skew.before) - abs(skew.arcsin))
+      names(improvements) <- c("logit_shrunk", "arcsine_sqrt")
+      if (all(improvements <= 0, na.rm = TRUE)) {
+        transformed.values <- variable.values
+        chosen.transform <- "none"
+        skew.after <- skew.before
+        selection.reason <- "transformation_does_not_improve_skewness"
+      } else {
+        chosen.transform <- names(which.max(improvements))
+        transformed.values <- switch(chosen.transform,
+                                     logit_shrunk = logit.values,
+                                     arcsine_sqrt = arcsin.values)
+        skew.after <- switch(chosen.transform,
+                             logit_shrunk = skew.logit,
+                             arcsine_sqrt = skew.arcsin)
+        selection.reason <- "best_transformation_was_chosen"
+      }
+      transformed.variable.list[[variable.name]] <- transformed.values
+      transform.name.map[[variable.name]] <- if (chosen.transform == "none") variable.name else paste0(variable.name, "_", chosen.transform)
+      if (!is.null(background.transformed.dataframe) && variable.name %in% colnames(background.transformed.dataframe)) {
+        bg.values <- background.transformed.dataframe[[variable.name]]
+        background.transformed.dataframe[[variable.name]] <- switch(chosen.transform,
+                                                                    logit_shrunk = perform.logit.transformation(bg.values),
+                                                                    arcsine_sqrt = asin(sqrt(pmin(pmax(bg.values, 0), 1))),
+                                                                    bg.values)
+      }
+      summary.record.list[[length(summary.record.list) + 1]] <- data.frame(variable = variable.name,
+                                                                           transform_chosen = chosen.transform,
+                                                                           transformed = chosen.transform != "none",
+                                                                           skew_before = round(skew.before, 2),
+                                                                           skew_after = round(skew.after, 2),
+                                                                           selection_reason = selection.reason,
+                                                                           stringsAsFactors = FALSE)
+      if (chosen.transform != "none") transform.counter[[chosen.transform]] <- (if (is.null(transform.counter[[chosen.transform]])) 0 else transform.counter[[chosen.transform]]) + 1
+      next
+    }
+    
+    # Regular numeric variable transformation
+    chosen.result <- choose.best.transformation(variable.values, skewness.threshold)
+    chosen.name <- chosen.result$name
+    transformed.variable.list[[variable.name]] <- chosen.result$transformed
+    transform.name.map[[variable.name]] <- if (chosen.name == "none") variable.name else paste0(variable.name, "_", chosen.name)
+    if (!is.null(background.transformed.dataframe) && variable.name %in% colnames(background.transformed.dataframe)) {
+      bg.values <- background.transformed.dataframe[[variable.name]]
+      background.transformed.dataframe[[variable.name]] <- switch(chosen.name,
+                                                                  log = log(bg.values),
+                                                                  log1p = log1p(bg.values),
+                                                                  sqrt = sqrt(bg.values),
+                                                                  cuberoot = sign(bg.values) * abs(bg.values)^(1/3),
+                                                                  log1p_shifted = log1p(bg.values - min(bg.values, na.rm = TRUE) + 1e-6),
+                                                                  sqrt_shifted = sqrt(bg.values - min(bg.values, na.rm = TRUE) + 1e-6),
+                                                                  bg.values)
+    }
+    summary.record.list[[length(summary.record.list) + 1]] <- data.frame(variable = variable.name,
+                                                                         transform_chosen = chosen.name,
+                                                                         transformed = chosen.name != "none",
+                                                                         skew_before = round(chosen.result$diagnostics$skew.before, 2),
+                                                                         skew_after = round(chosen.result$diagnostics$skew.after, 2),
+                                                                         selection_reason = chosen.result$diagnostics$selection.reason,
+                                                                         stringsAsFactors = FALSE)
+    if (chosen.name != "none") transform.counter[[chosen.name]] <- (if (is.null(transform.counter[[chosen.name]])) 0 else transform.counter[[chosen.name]]) + 1
+  }
+  
+  # Build transformation summary
+  transformation.summary <- do.call(rbind, summary.record.list)
+  
+  # Build full data frames from originals
+  occ_full <- data.frame_original
+  bg_full <- background.dataframe_original
+  
+  # Overwrite transformed variables in both occurrence + background (with suffixed names)
+  for (old in names(transformed.variable.list)) {
+    new <- transform.name.map[[old]]
+    occ_full[[new]] <- transformed.variable.list[[old]]
+    if (new != old) occ_full[[old]] <- NULL
+    if (!is.null(bg_full) && old %in% colnames(bg_full)) {
+      if (!is.null(background.transformed.dataframe)) {
+        bg_full[[new]] <- background.transformed.dataframe[[old]]
+        if (new != old) bg_full[[old]] <- NULL
+      }
+    }
+  }
+  
+  # Preserve original column order, but replace names by mapped (transformed) ones
+  final_order <- unlist(lapply(colnames(data.frame_original), function(nm) transform.name.map[[nm]]))
+  final_order <- unique(final_order[final_order %in% colnames(occ_full)])
+  occ_full <- occ_full[, final_order, drop = FALSE]
+  if (!is.null(bg_full)) bg_full <- bg_full[, final_order, drop = FALSE]
+  
+  # Verbose summary
+  if (verbose) {
+    transformed.vars <- sum(transformation.summary$transformed)
+    message("Transformations completed:")
+    message(sprintf("%d of %d variables transformed", transformed.vars, total.used))
+    if (length(transform.counter) > 0)
+      for (t in names(transform.counter))
+        message(sprintf("  %s: %d", t, transform.counter[[t]]))
+  }
+  
+  # Return results
+  list(transformed = occ_full,
+       summary = transformation.summary,
+       background.transformed = bg_full)
+  
